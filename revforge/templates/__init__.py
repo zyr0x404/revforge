@@ -1,0 +1,2 @@
+"""Procedural challenge templates."""
+
