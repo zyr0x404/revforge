@@ -10,8 +10,8 @@ import string
 from pathlib import Path
 from random import Random
 
-CREATED_BY = "zyr0x"
-BANNER = "RevForge challenge - created by zyr0x"
+CREATED_BY = "RevForge"
+BANNER = "RevForge challenge"
 
 _C_KEYWORDS = {
     "auto",
@@ -114,4 +114,3 @@ def env_flag(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
-

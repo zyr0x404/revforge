@@ -12,7 +12,17 @@ from random import Random
 from typing import Any
 
 from .flags import DEFAULT_FLAG_FORMAT, resolve_flag
-from .recipes import ChallengeRecipe, normalize_difficulty, normalize_target, resolve_template
+from .builders import build_challenge
+from .quality import quality_gate
+from .recipes import (
+    ChallengeRecipe,
+    default_style,
+    normalize_difficulty,
+    normalize_profile,
+    normalize_style,
+    normalize_target,
+    resolve_template,
+)
 from .targets import get_target
 from .templates.registry import prepare_recipe, render
 from .uniqueness import DuplicateRecipeError, RegistryEntry, add_recipe, is_known
@@ -42,12 +52,23 @@ def generate_challenge(
     competition_mode: bool = False,
     include_source: bool | None = None,
     include_solution: bool | None = None,
+    profile: str = "standard",
+    style: str | None = None,
+    family: str | None = None,
+    fake_flags: bool = False,
+    fake_flag_count: int = 3,
+    fake_flag_style: str = "default",
+    ai_recipe: dict[str, Any] | None = None,
 ) -> GenerationResult:
     """Generate a challenge folder and register its recipe hash."""
 
     safe_name = slugify_name(name)
     difficulty = normalize_difficulty(difficulty)
     target = normalize_target(target)
+    profile = normalize_profile(profile)
+    style = normalize_style(style) or default_style(difficulty, profile)
+    if template and family:
+        raise ValueError("use either --template or --family, not both")
     output_root = Path(out_dir).expanduser().resolve()
     challenge_dir = output_root / safe_name
     if challenge_dir.exists() and any(challenge_dir.iterdir()):
@@ -65,11 +86,19 @@ def generate_challenge(
             difficulty=difficulty,
             target=target,
             template=template,
+            family=family,
             seed=candidate_seed,
             flag=flag,
             random_flag=random_flag,
             flag_format=flag_format,
+            profile=profile,
+            style=style,
+            fake_flags=fake_flags,
+            fake_flag_count=fake_flag_count,
+            fake_flag_style=fake_flag_style,
         )
+        if ai_recipe:
+            _apply_ai_overrides(candidate, ai_recipe)
         candidate_hash = candidate.recipe_hash()
         if allow_repeat or not is_known(candidate_hash):
             recipe = candidate
@@ -82,8 +111,8 @@ def generate_challenge(
     if recipe is None:
         raise DuplicateRecipeError("could not generate a unique recipe after 32 attempts")
 
-    include_source_final = (not competition_mode) if include_source is None else include_source
-    include_solution_final = (not competition_mode) if include_solution is None else include_solution
+    include_source_final = True if competition_mode else ((not competition_mode) if include_source is None else include_source)
+    include_solution_final = False if competition_mode else ((not competition_mode) if include_solution is None else include_solution)
 
     ensure_dir(challenge_dir)
     _write_challenge_files(
@@ -94,6 +123,20 @@ def generate_challenge(
         include_source=include_source_final,
         include_solution=include_solution_final,
     )
+
+    if include_source_final and (target in {"elf", "exe", "macho"} or competition_mode):
+        ok, message = build_challenge(challenge_dir)
+        if not ok and competition_mode:
+            raise RuntimeError(f"competition-mode build failed: {message}")
+    if competition_mode:
+        binary_name = _binary_name(recipe.name, recipe.target)
+        if not (challenge_dir / "dist" / binary_name).exists():
+            raise RuntimeError("competition-mode export requires a built binary in dist/")
+
+    quality_gate(challenge_dir, recipe)
+
+    if competition_mode:
+        _finalize_competition_export(challenge_dir)
 
     metadata = load_metadata(challenge_dir)
     add_recipe(
@@ -138,13 +181,21 @@ def _create_recipe(
     difficulty: str,
     target: str,
     template: str | None,
+    family: str | None,
     seed: int,
     flag: str | None,
     random_flag: bool,
     flag_format: str | None,
+    profile: str,
+    style: str,
+    fake_flags: bool,
+    fake_flag_count: int,
+    fake_flag_style: str,
 ) -> ChallengeRecipe:
     rng = Random(seed)
-    selected_template = resolve_template(difficulty, template, rng)
+    selected_template = resolve_template(difficulty, family or template, rng, style=style, profile=profile)
+    if selected_template == "terminal_hybrid_finals" and (difficulty != "super-hard" or profile != "finals"):
+        raise ValueError("terminal_hybrid_finals requires --difficulty super-hard --profile finals")
     selected_flag, selected_format = resolve_flag(
         rng,
         flag=flag,
@@ -153,7 +204,28 @@ def _create_recipe(
     )
     function_names = random_identifiers(
         rng,
-        ["check", "stage", "mix", "decode", "guard", "noise"],
+        [
+            "check",
+            "stage",
+            "mix",
+            "decode",
+            "guard",
+            "noise",
+            "vm",
+            "step",
+            "accept",
+            "hash",
+            "table",
+            "gate",
+            "fold",
+            "branch",
+            "constraint",
+            "recover",
+            "dispatch",
+            "scramble",
+            "oracle",
+            "mask",
+        ],
         prefix="rf",
     )
     variable_names = random_identifiers(
@@ -172,8 +244,51 @@ def _create_recipe(
         function_names=function_names,
         variable_names=variable_names,
         created_by=CREATED_BY,
+        profile=profile,
+        style=style,
+        family=family or selected_template,
+        fake_flags_enabled=fake_flags,
+        fake_flag_count=_normalize_fake_flag_count(fake_flag_count if fake_flags else 0),
+        fake_flag_style=_normalize_fake_flag_style(fake_flag_style),
     )
     return prepare_recipe(recipe, rng)
+
+
+def _normalize_fake_flag_count(value: int) -> int:
+    try:
+        count = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("--fake-flag-count must be an integer") from exc
+    if count < 0 or count > 32:
+        raise ValueError("--fake-flag-count must be between 0 and 32")
+    return count
+
+
+def _normalize_fake_flag_style(value: str | None) -> str:
+    selected = (value or "default").strip().lower().replace("_", "-")
+    if selected not in {"default", "generic", "ctf", "mixed"}:
+        raise ValueError("--fake-flag-style must be one of default, generic, ctf, mixed")
+    return selected
+
+
+def _apply_ai_overrides(recipe: ChallengeRecipe, ai_recipe: dict[str, Any]) -> None:
+    story = ai_recipe.get("story")
+    if isinstance(story, str) and story.strip():
+        recipe.story = story.strip()
+    fake_strings = ai_recipe.get("fake_strings")
+    if isinstance(fake_strings, list):
+        clean = [str(item).strip() for item in fake_strings if str(item).strip()]
+        if clean:
+            recipe.fake_strings = clean[:8]
+    theme = ai_recipe.get("theme")
+    requested_features = ai_recipe.get("requested_features")
+    for key in ("profile", "style", "family", "terminal_commands", "artifact_files", "technique_mix", "complexity_budget"):
+        if key in ai_recipe:
+            recipe.constants[f"ai_{key}"] = ai_recipe[key]
+    recipe.constants["ai_theme"] = theme if isinstance(theme, str) else ""
+    recipe.constants["ai_requested_features"] = requested_features if isinstance(requested_features, list) else []
+    recipe.constants["ai_function_name_style"] = ai_recipe.get("function_name_style", "")
+    recipe.constants["ai_variable_name_style"] = ai_recipe.get("variable_name_style", "")
 
 
 def _write_challenge_files(
@@ -193,9 +308,13 @@ def _write_challenge_files(
     ensure_dir(challenge_dir / "dist")
     _write_readme(challenge_dir / "README.md", recipe, metadata, competition_mode)
 
+    for relpath, payload in (rendered.artifacts or {}).items():
+        artifact_path = challenge_dir / Path(relpath).name
+        artifact_path.write_bytes(payload)
+
     if competition_mode:
-        public = _public_metadata(metadata)
-        json_dump(challenge_dir / "metadata_public.json", public)
+        json_dump(challenge_dir / "metadata.json", metadata)
+        json_dump(challenge_dir / "recipe.json", {**recipe.to_dict(), "recipe_hash": recipe_hash})
     else:
         json_dump(challenge_dir / "metadata.json", metadata)
         json_dump(challenge_dir / "recipe.json", {**recipe.to_dict(), "recipe_hash": recipe_hash})
@@ -232,6 +351,9 @@ def _metadata(
         "difficulty": recipe.difficulty,
         "target": recipe.target,
         "template": recipe.template_family,
+        "profile": recipe.profile,
+        "style": recipe.style,
+        "family": recipe.family or recipe.template_family,
         "seed": recipe.seed,
         "flag": recipe.flag,
         "flag_format": recipe.flag_format,
@@ -242,7 +364,19 @@ def _metadata(
         "has_source": include_source,
         "has_solution": include_solution,
         "competition_mode": competition_mode,
-        "safety": "Generated program only reads user input and prints success or failure.",
+        "bytecode_length": int(recipe.constants.get("bytecode_length", 0)),
+        "constraint_count": int(recipe.constants.get("constraint_count", 0)),
+        "encoded_constant_count": int(recipe.constants.get("encoded_constant_count", 0)),
+        "local_artifact_count": int(recipe.constants.get("artifact_count", len(recipe.artifact_files))),
+        "terminal_commands": recipe.terminal_commands,
+        "artifact_files": recipe.artifact_files,
+        "technique_mix": recipe.technique_mix,
+        "complexity_budget": recipe.complexity_budget,
+        "fake_flags_enabled": recipe.fake_flags_enabled,
+        "fake_flag_count": len(recipe.fake_flags),
+        "fake_flag_style": recipe.fake_flag_style,
+        "validation_family": recipe.checker_type,
+        "safety": "Generated program is harmless and local-only. It only reads its local challenge artifacts and user-provided input.",
     }
 
 
@@ -252,6 +386,20 @@ def _public_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     public["has_solution"] = False
     public["has_source"] = False
     return public
+
+
+def _finalize_competition_export(challenge_dir: Path) -> None:
+    metadata = load_metadata(challenge_dir)
+    public = _public_metadata(metadata)
+    json_dump(challenge_dir / "metadata_public.json", public)
+    for relpath in ("metadata.json", "recipe.json", "build.sh", "Makefile", "writeup.md", "index.html"):
+        path = challenge_dir / relpath
+        if path.exists():
+            path.unlink()
+    for relpath in ("src", "solution", "app"):
+        path = challenge_dir / relpath
+        if path.exists():
+            shutil.rmtree(path)
 
 
 def _binary_name(name: str, target: str) -> str:
@@ -270,6 +418,43 @@ def _write_readme(path: Path, recipe: ChallengeRecipe, metadata: dict[str, Any],
         if competition_mode
         else "This educational bundle includes source, recipe metadata, and a solver for local training."
     )
+    if recipe.style == "terminal":
+        binary = metadata["binary_name"]
+        artifacts = "\n".join(f"- ./{name}" for name in recipe.artifact_files)
+        commands = "\n".join(_usage_lines(recipe, binary))
+        text = f"""# {recipe.name}
+
+## Files
+
+- ./dist/{binary}
+{artifacts}
+{"- ./metadata_public.json" if competition_mode else "- ./metadata.json"}
+
+## Usage
+
+```bash
+{commands}
+```
+
+## Challenge
+
+- Difficulty: `{recipe.difficulty}`
+- Profile: `{recipe.profile}`
+- Style: `{recipe.style}`
+- Family: `{recipe.family or recipe.template_family}`
+- Target: `{recipe.target}`
+
+{recipe.story}
+
+{mode_note}
+
+## Safety
+
+This challenge is harmless and local only. The generated program reads only its local challenge artifact files and user-provided input. It does not use networking, persistence, credential collection, privilege escalation, destructive behavior, evasion, or real exploitation.
+"""
+        path.write_text(text, encoding="utf-8")
+        return
+
     text = f"""# {recipe.name}
 
 Created by {CREATED_BY}
@@ -279,6 +464,8 @@ Created by {CREATED_BY}
 ## Challenge
 
 - Difficulty: `{recipe.difficulty}`
+- Profile: `{recipe.profile}`
+- Style: `{recipe.style}`
 - Target: `{recipe.target}`
 - Template: `{recipe.template_family}`
 - Recipe hash: `{metadata["recipe_hash"]}`
@@ -289,7 +476,7 @@ Created by {CREATED_BY}
 
 ## Safety
 
-This challenge is harmless and local only. The generated program reads a candidate flag from argv/stdin or a local UI, checks it in memory, and prints success or failure. It does not use networking, persistence, credential collection, privilege escalation, or destructive behavior.
+This challenge is harmless and local only. The generated program reads user-provided input, checks it in memory, and prints success or failure. It does not use networking, persistence, credential collection, privilege escalation, destructive behavior, evasion, or real exploitation.
 
 ## Build
 
@@ -304,6 +491,21 @@ Or use the generated `build.sh` when source files are included.
     path.write_text(text, encoding="utf-8")
 
 
+def _usage_lines(recipe: ChallengeRecipe, binary: str) -> list[str]:
+    exe = f"./dist/{binary}"
+    artifact = recipe.artifact_files[0] if recipe.artifact_files else "artifact.bin"
+    family = recipe.family or recipe.template_family
+    if family in {"terminal_firmware_blob", "qualifier_state_machine"}:
+        return [f"{exe} --help", f"{exe} verify <candidate>", f"{exe} check {artifact}"]
+    if family in {"terminal_license_vm", "qualifier_vm"}:
+        return [f"{exe} --help", f"{exe} info", f"{exe} verify <key>", f"{exe} check {artifact}"]
+    if family in {"terminal_signal_pipeline", "qualifier_transform_pipeline"}:
+        return [f"{exe} --help", f"{exe} scan {artifact}", f"{exe} verify <candidate>"]
+    if family in {"terminal_constraints_pack", "qualifier_constraints"}:
+        return [f"{exe} --help", f"{exe} verify <candidate>", f"{exe} check {artifact}"]
+    return [f"{exe} --help", f"{exe} info", f"{exe} verify <candidate>", f"{exe} check {artifact}"]
+
+
 def _write_build_files(challenge_dir: Path, recipe: ChallengeRecipe, binary_name: str) -> None:
     build_sh = _build_script(recipe, binary_name)
     build_path = challenge_dir / "build.sh"
@@ -314,12 +516,13 @@ def _write_build_files(challenge_dir: Path, recipe: ChallengeRecipe, binary_name
 
 def _build_script(recipe: ChallengeRecipe, binary_name: str) -> str:
     if recipe.target == "elf":
+        strip_flag = " -s" if recipe.difficulty in {"hard", "super-hard"} else ""
         return f"""#!/usr/bin/env bash
 # Created by {CREATED_BY}
 set -euo pipefail
 mkdir -p dist
 CC="${{CC:-gcc}}"
-"$CC" -std=c11 -O2 -Wall -Wextra src/main.c -o dist/{binary_name}
+"$CC" -std=c11 -O2 -Wall -Wextra{strip_flag} src/main.c -o dist/{binary_name}
 echo "built dist/{binary_name}"
 """
     if recipe.target == "exe":
@@ -332,7 +535,7 @@ if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
   exit 1
 fi
 mkdir -p dist
-x86_64-w64-mingw32-gcc -O2 -Wall -Wextra src/main.c -o dist/{binary_name}
+x86_64-w64-mingw32-gcc -O2 -Wall -Wextra{" -s" if recipe.difficulty in {"hard", "super-hard"} else ""} src/main.c -o dist/{binary_name}
 echo "built dist/{binary_name}"
 """
     if recipe.target == "macho":
@@ -345,7 +548,7 @@ if [ "$(uname -s)" != "Darwin" ]; then
   exit 1
 fi
 mkdir -p dist
-clang -std=c11 -O2 -Wall -Wextra src/main.c -o dist/{binary_name}
+clang -std=c11 -O2 -Wall -Wextra{" -s" if recipe.difficulty in {"hard", "super-hard"} else ""} src/main.c -o dist/{binary_name}
 echo "built dist/{binary_name}"
 """
     if recipe.target == "wasm":
@@ -385,9 +588,10 @@ echo "build complete"
 
 def _makefile(recipe: ChallengeRecipe, binary_name: str) -> str:
     if recipe.target == "elf":
+        strip_flag = " -s" if recipe.difficulty in {"hard", "super-hard"} else ""
         return f"""# Created by {CREATED_BY}
 CC ?= gcc
-CFLAGS ?= -std=c11 -O2 -Wall -Wextra
+CFLAGS ?= -std=c11 -O2 -Wall -Wextra{strip_flag}
 
 .PHONY: all clean
 all:
@@ -398,9 +602,10 @@ clean:
 \trm -rf dist
 """
     if recipe.target == "exe":
+        strip_flag = " -s" if recipe.difficulty in {"hard", "super-hard"} else ""
         return f"""# Created by {CREATED_BY}
 CC ?= x86_64-w64-mingw32-gcc
-CFLAGS ?= -O2 -Wall -Wextra
+CFLAGS ?= -O2 -Wall -Wextra{strip_flag}
 
 .PHONY: all clean
 all:
@@ -411,9 +616,10 @@ clean:
 \trm -rf dist
 """
     if recipe.target == "macho":
+        strip_flag = " -s" if recipe.difficulty in {"hard", "super-hard"} else ""
         return f"""# Created by {CREATED_BY}
 CC ?= clang
-CFLAGS ?= -std=c11 -O2 -Wall -Wextra
+CFLAGS ?= -std=c11 -O2 -Wall -Wextra{strip_flag}
 
 .PHONY: all clean
 all:

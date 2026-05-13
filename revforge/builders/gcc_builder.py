@@ -30,9 +30,11 @@ def build(challenge_dir: Path, metadata: dict) -> tuple[bool, str]:
     dist = challenge_dir / "dist"
     dist.mkdir(exist_ok=True)
     output = dist / metadata["binary_name"]
-    cmd = [compiler, "-std=c11", "-O2", "-Wall", "-Wextra", str(source), "-o", str(output)]
+    cmd = [compiler, "-std=c11", "-O2", "-Wall", "-Wextra"]
+    if metadata.get("difficulty") in {"hard", "super-hard"}:
+        cmd.append("-s")
+    cmd.extend([str(source), "-o", str(output)])
     result = subprocess.run(cmd, cwd=challenge_dir, text=True, capture_output=True, check=False)
     if result.returncode != 0:
         return False, result.stderr.strip() or result.stdout.strip()
     return True, f"built {output}"
-

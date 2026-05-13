@@ -1,7 +1,5 @@
 # Contributing
 
-Created by zyr0x
-
 Thanks for improving RevForge. Keep changes focused, testable, and aligned with the safety policy.
 
 ## Local Setup
@@ -20,8 +18,8 @@ New templates must:
 
 - Generate different recipes through randomized constants, names, fake strings, stories, and checker logic.
 - Be reproducible with `--seed`.
-- Produce only harmless local crackme behavior.
-- Include `Created by zyr0x` in generated source files.
+- Produce only harmless local reverse engineering behavior.
+- Include generic RevForge provenance in generated source files.
 - Include a real `solution/solve.py` unless competition mode omits it.
 - Add tests that exercise the new template.
 
@@ -34,5 +32,4 @@ Target support must be honest. If a toolchain is missing or cross-compilation is
 - `pytest` passes.
 - New behavior is documented.
 - Safety rules are preserved.
-- Generated metadata includes `created_by: "zyr0x"`.
-
+- Generated metadata includes generic RevForge provenance.

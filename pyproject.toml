@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "revforge"
-version = "0.1.0"
+version = "0.4.0"
 description = "Safe educational reverse engineering CTF challenge generator"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "zyr0x" }]
+authors = [{ name = "RevForge" }]
 keywords = ["ctf", "reverse-engineering", "crackme", "education", "security-training"]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -38,4 +38,3 @@ include = ["revforge*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-

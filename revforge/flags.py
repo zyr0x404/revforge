@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from random import Random
 
-DEFAULT_FLAG_FORMAT = "zyr0x{{{value}}}"
+DEFAULT_FLAG_FORMAT = "revforge{{{value}}}"
 
 _SYLLABLES = [
     "r3v",
@@ -33,7 +33,7 @@ def render_flag(flag_format: str, value: str) -> str:
         try:
             return flag_format.format(value=value)
         except (KeyError, IndexError, ValueError) as exc:
-            raise ValueError('flag format must use the placeholder "{value}", e.g. "zyr0x{{{value}}}"') from exc
+            raise ValueError('flag format must use the placeholder "{value}", e.g. "revforge{{{value}}}"') from exc
     return f"{flag_format}{value}"
 
 
